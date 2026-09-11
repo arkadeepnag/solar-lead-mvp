@@ -1,0 +1,9 @@
+{
+ "type":"FeatureCollection","features":[
+ {"type":"Feature","properties":{"leadId":"OKH-041","height":12},"geometry":{"type":"Polygon","coordinates":[[[77.27042,28.55178],[77.27080,28.55178],[77.27080,28.55205],[77.27042,28.55205],[77.27042,28.55178]]]}},
+ {"type":"Feature","properties":{"leadId":"OKH-E48","height":9},"geometry":{"type":"Polygon","coordinates":[[[77.26880,28.55091],[77.26915,28.55091],[77.26915,28.55116],[77.26880,28.55116],[77.26880,28.55091]]]}},
+ {"type":"Feature","properties":{"leadId":"OKH-B22","height":8},"geometry":{"type":"Polygon","coordinates":[[[77.26765,28.54938],[77.26796,28.54938],[77.26796,28.54960],[77.26765,28.54960],[77.26765,28.54938]]]}},
+ {"type":"Feature","properties":{"leadId":"OKH-A34","height":10},"geometry":{"type":"Polygon","coordinates":[[[77.27205,28.55010],[77.27238,28.55010],[77.27238,28.55038],[77.27205,28.55038],[77.27205,28.55010]]]}},
+ {"type":"Feature","properties":{"leadId":"OKH-F28","height":7},"geometry":{"type":"Polygon","coordinates":[[[77.26705,28.55232],[77.26734,28.55232],[77.26734,28.55256],[77.26705,28.55256],[77.26705,28.55232]]]}}
+ ]
+}

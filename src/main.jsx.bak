@@ -1,0 +1,136 @@
+import React, {useEffect, useMemo, useRef, useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import {area, centroid, distance} from '@turf/turf';
+import * as SunCalc from 'suncalc';
+import './styles.css';
+
+const fmtINR=n=>new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(n||0);
+const clamp=(n,a,b)=>Math.max(a,Math.min(b,n));
+const emi=(principal,annual,months)=>{const r=annual/1200;return r?principal*r*Math.pow(1+r,months)/(Math.pow(1+r,months)-1):principal/months};
+function irr(cash){let lo=-.9,hi=1.2;for(let i=0;i<80;i++){const r=(lo+hi)/2;let npv=cash[0];for(let y=1;y<cash.length;y++)npv+=cash[y]/Math.pow(1+r,y);if(npv>0)lo=r;else hi=r}return (lo+hi)/2}
+function sunPosition(hour){const d=new Date();d.setHours(Math.floor(hour),Math.round((hour%1)*60),0,0);const p=SunCalc.getPosition(d,34.165,77.585);return {az:Math.round((p.azimuth*180/Math.PI+180+360)%360),el:Math.round(Math.max(0,p.altitude*180/Math.PI))}}
+function band(prop,credit){if(prop>=75&&credit>=70)return ['FUNDABLE HOT','good'];if(prop>=75&&credit<70)return ['HOT / CREDIT RISK','risk'];if(prop<75&&credit>=70)return ['CREDIT FIT / LOW PROP','watch'];return ['LOW PRIORITY','low']}
+function calcLead(p,target){
+  const factor=target==='Residential'?0.86:1;
+  const system=Math.max(.8,p.kw*factor);
+  const subsidy=target==='Residential'?Math.min(78000,30000*Math.min(2,system)+18000*Math.max(0,Math.min(1,system-2))):0;
+  const capex=system*(target==='Residential'?52000:47000); const netCapex=Math.max(0,capex-subsidy);
+  const tariff=target==='Residential'?7.4:p.tariff;
+  const usable=Math.max(0,p.usableArea || p.roofArea*.72);
+  const orientationFactor=clamp(1-Math.abs((p.orientation||180)-180)/360,.72,1);
+  const solarYield=(p.solar||5.1)*365*0.78*orientationFactor*(1-(p.shade||0)/100);
+  const annualGen=Math.max(0,system*solarYield);
+  const annualSave=annualGen*tariff;
+  const loan=netCapex*.75; const e=emi(loan,target==='Residential'?9.5:10.5,84); const netMonthly=annualSave/12-e;
+  const cash=[-netCapex];for(let y=1;y<=20;y++)cash.push(annualSave*Math.pow(.995,y)-capex*.012);
+  const propensity=clamp(Math.round(p.propensity + (annualSave>500000?4:0) - (p.shade>30?6:0)),0,100);
+  const credit=clamp(Math.round(p.credit + (p.bill>100000?3:0) - (p.vintage<2012?7:0)),0,100);
+  return {...p,system:+system.toFixed(1),subsidy,capex,netCapex,annualGen:Math.round(annualGen),annualSave:Math.round(annualSave),emi:Math.round(e),netMonthly:Math.round(netMonthly),payback:+(netCapex/Math.max(annualSave,1)).toFixed(2),irr:+(irr(cash)*100).toFixed(1),propensity,credit,usableCalc:+usable.toFixed(0),orientationFactor:+orientationFactor.toFixed(2),target,band:band(propensity,credit)};
+}
+
+function DualAxis({leads,selected,target}){
+  const scored=leads.map(p=>calcLead(p,target));
+  const selectedLead=scored.find(x=>x.id===selected);
+  return <div className="axisCard">
+    <div className="axisHead"><div><b>DUAL-AXIS LEAD SCORE</b><span>Conversion propensity × credit eligibility — never collapse the two into one score.</span></div><div className="axisLegend"><span><i className="legendDot green"/>Fundable hot</span><span><i className="legendDot amber"/>Credit risk</span></div></div>
+    <div className="axisBody">
+      <div className="scatter"><div className="quad q1"><b>FUNDABLE HOT</b><small>dispatch</small></div><div className="quad q2"><b>HOT / CREDIT RISK</b><small>underwrite</small></div><div className="quad q3"><b>LOW PRIORITY</b></div><div className="quad q4"><b>CREDIT FIT / LOW PROP</b><small>nurture</small></div>{scored.slice(0,160).map(p=><button key={p.id} title={`${p.name} · ${p.propensity}/${p.credit}`} className={`point ${p.id===selected?'chosen':''} ${p.band[1]}`} style={{left:`${clamp(p.propensity,2,98)}%`,bottom:`${clamp(p.credit,2,98)}%`}} onClick={()=>document.querySelector(`[data-lead-id="${p.id}"]`)?.click()}/>) }<div className="xAxis">CONVERSION PROPENSITY →</div><div className="yAxis">CREDIT ELIGIBILITY ↑</div></div>
+      <div className="axisStats"><div><small>FUNDED-HOT</small><strong>{scored.filter(p=>p.propensity>=75&&p.credit>=70).length}</strong><span>both gates passed</span></div><div><small>HOT / RISK</small><strong className="riskText">{scored.filter(p=>p.propensity>=75&&p.credit<70).length}</strong><span>sales-ready, underwriting risk</span></div><div><small>CREDIT FIT</small><strong>{scored.filter(p=>p.propensity<75&&p.credit>=70).length}</strong><span>nurture / assisted conversion</span></div>{selectedLead&&<div className="selectedAxis"><small>SELECTED PARCEL</small><strong>{selectedLead.propensity} / {selectedLead.credit}</strong><span>{selectedLead.band[0]}</span></div>}</div>
+    </div>
+  </div>
+}
+
+function MapPanel({selected,setSelected,heatMode,setHeatMode,sunHour,setSunHour}){
+ const ref=useRef(null),mapRef=useRef(null),parcelData=useRef(null),heatData=useRef(null);
+ const [parcelStats,setParcelStats]=useState({count:0,area:0}),[view3d,setView3d]=useState(true),[zoomLevel,setZoomLevel]=useState(14.2);
+ const makeHeatFeatures=(pts,mode,hour)=>({type:'FeatureCollection',features:pts.map((p,i)=>{
+   let v=p[2];
+   if(mode==='shade') v=clamp((p[4]/100)*(0.35+0.65*Math.max(.05,Math.sin(Math.PI*((hour-6)/12)))),.02,.98);
+   if(mode==='weather') v=clamp((1-(p[4]/150))*((p[2]*.78)+.22),.02,1);
+   if(mode==='kW') v=clamp(p[2]*.96,.02,1);
+   const sun=sunPosition(hour); const solarAngle=clamp(sun.el/75,.1,1);
+   v=clamp(v*(.72+.28*solarAngle),.01,1);
+   return {type:'Feature',geometry:{type:'Point',coordinates:[p[1],p[0]]},properties:{value:v,solar:p[3],shade:p[4],mode,index:i}};
+ })});
+ const applyHeat=()=>{const map=mapRef.current;if(!map||!heatData.current||!map.getSource('solar-heat'))return;map.getSource('solar-heat').setData(makeHeatFeatures(heatData.current,heatMode,sunHour));};
+ useEffect(()=>{
+   if(mapRef.current)return;
+   const map=new maplibregl.Map({container:ref.current,center:[77.585,34.165],zoom:14.2,pitch:52,bearing:-18,maxPitch:70,attributionControl:false,style:{version:8,sources:{
+     osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors'},
+     openfreemap:{type:'vector',url:'https://tiles.openfreemap.org/planet'}
+   },layers:[
+     {id:'osm',type:'raster',source:'osm',paint:{'raster-opacity':.92}},
+     {id:'3d-buildings',type:'fill-extrusion',source:'openfreemap','source-layer':'building',minzoom:13.5,paint:{
+       'fill-extrusion-color':['interpolate',['linear'],['coalesce',['get','render_height'],8],0,'#18251f',8,'#34463d',20,'#53665c',60,'#78867c',120,'#9aa49d'],
+       'fill-extrusion-height':['coalesce',['get','render_height'],8],
+       'fill-extrusion-base':['coalesce',['get','render_min_height'],0],
+       'fill-extrusion-opacity':['interpolate',['linear'],['zoom'],13.5,.72,15,.88,17,.96],
+       'fill-extrusion-vertical-gradient':true
+     }}
+   ]}});
+   mapRef.current=map;
+   map.addControl(new maplibregl.NavigationControl({visualizePitch:true}), 'bottom-right');
+   map.addControl(new maplibregl.ScaleControl({maxWidth:100,unit:'metric'}),'bottom-left');
+   map.on('load',async()=>{
+     try{
+       const [g,pts]=await Promise.all([fetch('/data/leh-cadastral-demo.geojson').then(r=>r.json()),fetch('/data/leh-solar-grid.json').then(r=>r.json())]);
+       parcelData.current=g;heatData.current=pts;
+       const total=g.features.reduce((sum,f)=>sum+area(f),0);setParcelStats({count:g.features.length,area:Math.round(total)});
+       map.addSource('cadastral',{type:'geojson',data:g});
+       map.addSource('solar-heat',{type:'geojson',data:makeHeatFeatures(pts,'solar',13.5)});
+       map.addLayer({id:'solar-heat',type:'heatmap',source:'solar-heat',maxzoom:17,paint:{
+         'heatmap-weight':['interpolate',['linear'],['get','value'],0,0,1,1],
+         'heatmap-intensity':['interpolate',['linear'],['zoom'],10,.55,13,.9,15,1.15,17,1.3],
+         'heatmap-radius':['interpolate',['linear'],['zoom'],10,18,12,25,14,34,16,46,18,60],
+         'heatmap-opacity':['interpolate',['linear'],['zoom'],10,.58,13,.52,15,.42,17,.25],
+         'heatmap-color':['interpolate',['linear'],['heatmap-density'],0,'rgba(0,0,0,0)',.12,'rgba(30,70,52,.10)',.3,'rgba(95,130,72,.22)',.5,'rgba(211,189,72,.38)',.7,'rgba(255,156,56,.56)',.86,'rgba(255,78,44,.70)',1,'rgba(255,38,38,.82)']
+       }},'3d-buildings');
+       map.addLayer({id:'cadastral-fill',type:'fill',source:'cadastral',paint:{'fill-color':'#07100d','fill-opacity':0.025}},'3d-buildings');
+       map.addLayer({id:'cadastral-outline',type:'line',source:'cadastral',paint:{'line-color':['case',['boolean',['feature-state','selected'],false],'#c9ff3d','#9aa79f'],'line-width':['case',['boolean',['feature-state','selected'],false],2.5,0.55],'line-opacity':['case',['boolean',['feature-state','selected'],false],1,.38]}});
+       const bounds=new maplibregl.LngLatBounds();
+       g.features.forEach(f=>{const ring=f.geometry.coordinates[0]||[];ring.forEach(c=>bounds.extend(c));});
+       map.fitBounds(bounds,{padding:{top:120,bottom:120,left:30,right:30},duration:0,maxZoom:15});
+       applyHeat();
+     }catch(e){console.error('SolarOS map data error',e)}
+   });
+   map.on('zoom',()=>setZoomLevel(map.getZoom()));
+   map.on('click','cadastral-outline',(e)=>{
+     const f=e.features?.[0];if(!f)return;const p=f.properties;const m=centroid(f).geometry.coordinates;const measured=Math.round(area(f));
+     map.setFeatureState({source:'cadastral',id:f.id}, {selected:true});
+     setSelected(p.id);
+     new maplibregl.Popup({closeButton:true,offset:14,maxWidth:'330px'}).setLngLat(e.lngLat).setHTML(`<div class="mapPopup"><div class="popupKicker">SOLAROS LEAD PARCEL</div><h3>${p.name}</h3><p>${p.address}</p><div class="popupGrid"><b>${p.kw} kW</b><span>modeled system</span><b>${measured.toLocaleString()} m²</b><span>parcel geometry</span><b>${p.propensity} / ${p.credit}</b><span>propensity / credit</span><b>${p.solar} kWh/m²/day</b><span>solar resource</span></div><small>Centroid ${m[1].toFixed(5)}, ${m[0].toFixed(5)}</small></div>`).addTo(map);
+   });
+   map.on('mouseenter','cadastral-outline',()=>map.getCanvas().style.cursor='pointer');
+   map.on('mouseleave','cadastral-outline',()=>map.getCanvas().style.cursor='');
+   map.on('click','3d-buildings',(e)=>{const p=e.features?.[0]?.properties||{};if(!e.features?.[0])return;const h=Number(p.render_height||p.height||p['building:levels']*3||8);new maplibregl.Popup({closeButton:true,offset:8,maxWidth:'280px'}).setLngLat(e.lngLat).setHTML(`<div class="mapPopup"><div class="popupKicker">OPEN BUILDING MODEL</div><h3>OSM building footprint</h3><p>3D extrusion from OpenFreeMap / OpenStreetMap building data.</p><div class="popupGrid"><b>${h.toFixed(1)} m</b><span>rendered height</span><b>${p['building:levels']||'—'}</b><span>mapped levels</span><b>${p.building||'building'}</b><span>OSM class</span></div></div>`).addTo(map);});
+   return()=>map.remove();
+ },[]);
+ useEffect(()=>{if(!mapRef.current||!parcelData.current)return;const map=mapRef.current;const selectedId=parcelData.current.features.findIndex(f=>f.properties.id===selected);parcelData.current.features.forEach((f,i)=>{try{map.setFeatureState({source:'cadastral',id:f.id},{selected:f.properties.id===selected})}catch{}});if(selectedId>=0){const f=parcelData.current.features[selectedId];const c=centroid(f).geometry.coordinates;map.easeTo({center:c,zoom:Math.max(map.getZoom(),14.7),duration:450});}},[selected]);
+ useEffect(()=>{applyHeat();},[heatMode,sunHour]);
+ const toggle3d=()=>{const map=mapRef.current;if(!map)return;const next=!view3d;setView3d(next);map.easeTo({pitch:next?52:0,bearing:next?-18:0,duration:500});};
+ const pos=sunPosition(sunHour);
+ return <div className="mapWrap"><div className="mapTop"><div><span className="eyebrow">LEH / LADAKH · 3D ROOFTOP INTELLIGENCE</span><h2>Real building footprints, continuous solar field, cadastral lead layer.</h2></div><div className="mapLegend"><span><i className="dot hot"/>high resource</span><span><i className="dot mid"/>variable</span><span><i className="dot risk"/>shade / weather</span></div></div><div className="map" ref={ref}/><div className="mapStats"><b>{parcelStats.count||843}</b><span>lead parcels</span><b>{zoomLevel.toFixed(1)}×</b><span>zoom</span><b>{view3d?'3D':'2D'}</b><span>buildings</span></div><div className="mapTools"><button onClick={toggle3d}>{view3d?'2D top':'3D buildings'} ↗</button><span>Buildings: OpenFreeMap / OSM</span></div><div className="mapControls"><div className="modeBtns">{['solar','shade','weather','kW'].map(x=><button key={x} className={heatMode===x?'active':''} onClick={()=>setHeatMode(x)}>{x==='kW'?'TAM kW':x[0].toUpperCase()+x.slice(1)}</button>)}</div><div className="sun"><span>☀</span><input type="range" min="6" max="18" step=".25" value={sunHour} onChange={e=>setSunHour(+e.target.value)}/><b>{sunHour.toFixed(2)}h</b><small>AZ {pos.az}° · EL {pos.el}° · SunCalc</small></div></div><div className="mapCaption">Heatmap is a continuous MapLibre heat layer, not building fills · cadastral outlines are separate from OSM building extrusions · click either layer for details.</div></div>
+}
+function Spark({values}){const w=320,h=90,p=6,min=Math.min(...values),max=Math.max(...values);const pts=values.map((v,i)=>`${p+i*(w-2*p)/(values.length-1)},${h-p-(v-min)/(max-min||1)*(h-2*p)}`).join(' ');return <svg className="spark" viewBox={`0 0 ${w} ${h}`}><polyline points={pts} fill="none" stroke="#c9ff3d" strokeWidth="3"/><line x1="0" y1={h-10} x2={w} y2={h-10} stroke="#24332c"/></svg>}
+
+function App(){
+ const [leads,setLeads]=useState([]),[selected,setSelected]=useState(null),[tab,setTab]=useState('Discovery'),[target,setTarget]=useState('C&I'),[heatMode,setHeatMode]=useState('solar'),[sunHour,setSunHour]=useState(13.5),[wa,setWa]=useState(false),[scan,setScan]=useState(false),[search,setSearch]=useState('');
+ useEffect(()=>{fetch('/data/leads.json').then(r=>r.json()).then(d=>{setLeads(d);setSelected(d[0]?.id)})},[]);
+ const filtered=useMemo(()=>leads.map(x=>calcLead(x,target)).filter(x=>x.name.toLowerCase().includes(search.toLowerCase())||x.id.toLowerCase().includes(search.toLowerCase())).filter(x=>target==='C&I'?x.kw>=20:true).sort((a,b)=>Math.min(b.propensity,b.credit)-Math.min(a.propensity,a.credit)).slice(0,10),[leads,search,target]);
+ const raw=leads.find(x=>x.id===selected)||leads[0];const lead=raw?calcLead(raw,target):null;const sun=sunPosition(sunHour);
+ const runScan=()=>{setScan(true);setTimeout(()=>{setLeads(l=>[...l].sort((a,b)=>Math.min(calcLead(b,target).propensity,calcLead(b,target).credit)-Math.min(calcLead(a,target).propensity,calcLead(a,target).credit)));setScan(false)},600)};
+ const exportList=()=>{const blob=new Blob([JSON.stringify(filtered,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='solaros-leh-shortlist.json';a.click();URL.revokeObjectURL(a.href)};
+ const months=[.72,.81,.94,1.06,1.17,1.24,1.21,1.11,.98,.86,.75,.68].map(v=>Math.round(v*(lead?.annualGen||0)/12));
+ return <div className="app"><header><div className="brand"><div className="logo">S</div><div><strong>SolarOS</strong><small>ROOFTOP INTELLIGENCE</small></div></div><div className="territory"><b>LEH</b><span>India · Ladakh</span><em>843 roofs modeled</em></div><div className="search"><span>⌕</span><input placeholder="Search company / parcel" value={search} onChange={e=>setSearch(e.target.value)}/></div><div className="live"><i/>LIBRARY-DRIVEN DEMO</div></header>
+ <div className="body"><aside><div className="navtitle">PIPELINE</div>{['Discovery','Viability','Credit & offers','Partner routing','Learning'].map(t=><button key={t} className={tab===t?'on':''} onClick={()=>setTab(t)}><span>{t==='Discovery'?'◈':t==='Viability'?'◉':t==='Credit & offers'?'◌':t==='Partner routing'?'↗':'⌁'}</span>{t}</button>)}<div className="sideDivider"/><div className="navtitle">TARGET</div><div className="seg"><button className={target==='C&I'?'on':''} onClick={()=>setTarget('C&I')}>C&I</button><button className={target==='Residential'?'on':''} onClick={()=>setTarget('Residential')}>Residential</button></div><div className="source"><b>OPEN SOURCE STACK</b><span>MapLibre + GeoJSON lead parcels</span><span>Turf.js spatial measurement</span><span>SunCalc solar position</span><span>pvlib / PVWatts model reference</span><span>OSM + OpenFreeMap 3D buildings</span></div></aside>
+ <main><div className="hero"><div><span className="eyebrow">{tab.toUpperCase()} / LEH</span><h1>{tab==='Discovery'?'Discover prospects before they raise a hand.':tab==='Viability'?'Prove the roof before a field visit.':tab==='Credit & offers'?'Underwrite the lead before dispatch.':tab==='Partner routing'?'Route only leads that can survive contact.':'Turn outcomes into better targeting.'}</h1><p>{tab==='Discovery'?'Build a ranked target universe from cadastral geometry, rooftop economics and business proxies.':'Every view is tied to the selected parcel and keeps conversion propensity separate from credit eligibility.'}</p></div><div className="actions"><button onClick={exportList}>⇩ Export shortlist</button><button className="primary" onClick={runScan}>{scan?'Scanning…':'Run territory scan ↗'}</button></div></div>
+ <MapPanel selected={selected} setSelected={setSelected} heatMode={heatMode} setHeatMode={setHeatMode} sunHour={sunHour} setSunHour={setSunHour}/>
+ <DualAxis leads={leads} selected={selected} target={target}/>
+ <div className="contentGrid"><section className="rank"><div className="sectionHead"><div><b>Priority rooftops</b><span>{filtered.length} shown · rank = bottleneck gate, axes stay separate</span></div><span className="dispatchQ">DISPATCH QUEUE</span></div>{filtered.map((x,i)=>{const b=x.band;return <button data-lead-id={x.id} className={'leadRow '+(selected===x.id?'selected':'')} key={x.id} onClick={()=>{setSelected(x.id);setTab('Viability')}}><div className="rankNo">{String(i+1).padStart(2,'0')}</div><div className="leadMain"><strong>{x.name}</strong><small>{x.address}</small><div><span>{x.kw} kW</span><span>{Math.round(x.roofArea)} m² roof</span><span>₹{x.tariff}/kWh</span></div><em className={`bandPill ${b[1]}`}>{b[0]}</em></div><div className="scores"><label>PROP <b>{x.propensity}</b></label><i><em style={{width:`${x.propensity}%`}}/></i><label>CREDIT <b>{x.credit}</b></label><i className="credit"><em style={{width:`${x.credit}%`}}/></i></div></button>})}</section>
+ <section className="detail">{lead&&<><div className="detailHead"><div><span className="badge">{lead.band[0]}</span><h2>{lead.name}</h2><p>{lead.address} · parcel {lead.id}</p></div><button className="dispatch" onClick={()=>setWa(true)}>QUALIFY ↗</button></div><div className="metrics"><div className="metric"><small>SYSTEM</small><strong>{lead.system} kW</strong><span>{Math.round(lead.usableCalc)} m² usable</span></div><div className="metric"><small>ANNUAL GENERATION</small><strong>{lead.annualGen.toLocaleString()} kWh</strong><span>{lead.solar} kWh/m²/day resource</span></div><div className="metric"><small>PAYBACK</small><strong>{lead.payback} yr</strong><span>IRR {lead.irr}%</span></div><div className="metric"><small>NET / MONTH</small><strong>{fmtINR(lead.netMonthly)}</strong><span>after indicative EMI</span></div></div><div className="scoregrid"><div><div className="scoreTitle"><span>CONVERSION PROPENSITY</span><b>{lead.propensity}</b></div><div className="bar"><i style={{width:`${lead.propensity}%`}}/></div><small>roof economics + business-fit signals</small></div><div><div className="scoreTitle"><span>CREDIT ELIGIBILITY</span><b className="orange">{lead.credit}</b></div><div className="bar orange"><i style={{width:`${lead.credit}%`}}/></div><small>load / bill / vintage / affordability proxy</small></div></div><div className="lower"><div className="analysis"><div className="cardHead"><b>Solar yield profile</b><span>modeled monthly kWh</span></div><Spark values={months}/><div className="months">{['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map(m=><span key={m}>{m[0]}</span>)}</div><div className="miniGrid"><div><small>SHADE</small><b>{lead.shade}%</b></div><div><small>AZIMUTH</small><b>{lead.orientation}°</b></div><div><small>TARIFF</small><b>₹{lead.tariff}</b></div><div><small>SUN</small><b>{sun.el}°</b></div></div></div><div className="offer"><div className="cardHead"><b>Instant offer</b><span>{target}</span></div><div className="offerBig">{fmtINR(lead.netMonthly)}<small>monthly savings after EMI</small></div><div className="offerLines"><span>System <b>{lead.system} kW</b></span><span>CAPEX <b>{fmtINR(lead.capex)}</b></span><span>Subsidy <b>{fmtINR(lead.subsidy)}</b></span><span>EMI <b>{fmtINR(lead.emi)}</b></span></div><button onClick={()=>setWa(true)}>START WHATSAPP QUALIFICATION</button></div></div></>}</section></div>
+ <section className="workbench">{tab==='Discovery'&&<><div><b>OUTBOUND PROSPECT DISCOVERY</b><span>Parcel geometry → roof footprint → business identity proxy → tariff → ranked address.</span></div><div className="flow"><i>GeoJSON parcel</i><b>→</b><i>Turf area / centroid</i><b>→</b><i>Roof economics</i><b>→</b><i>Udyam · GST · MCA proxy</i><b>→</b><i>Dual-axis score</i></div><div className="statline"><b>{leads.length}</b><span>candidate roofs</span><b>{leads.filter(x=>x.propensity>=75).length}</b><span>high-propensity</span><b>{leads.filter(x=>x.credit>=70).length}</b><span>credit-ready</span></div></>}{tab==='Viability'&&<><div><b>SOLAR VIABILITY ENGINE</b><span>Usable roof × spatial solar resource × shade × orientation × tariff.</span></div><div className="viabilityBars"><span>Roof usable <i style={{width:`${clamp((lead?.usableCalc||0)/(lead?.roofArea||1)*100,0,100)}%`}}/></span><span>Solar resource <i style={{width:`${clamp(((lead?.solar||4.5)-4)*62,0,100)}%`}}/></span><span>Shade penalty <i className="orangeBar" style={{width:`${lead?.shade||0}%`}}/></span></div><div className="sunCard"><b>Sun geometry · SunCalc</b><span>{sun.az}° azimuth · {sun.el}° elevation · {sunHour.toFixed(2)}h</span><em>Heat field reweights continuously as the sun moves.</em></div></>}{tab==='Credit & offers'&&<><div><b>DUAL-AXIS UNDERWRITING</b><span>A hot roof is not a good lead if the financing gate fails.</span></div><div className="twoAxis"><div><small>CONVERSION</small><strong>{lead?.propensity}/100</strong><em>sales likelihood</em></div><div><small>CREDIT</small><strong className="orangeText">{lead?.credit}/100</strong><em>eligibility / affordability</em></div><div><small>EMI</small><strong>{fmtINR(lead?.emi)}</strong><em>84 month indicative</em></div><div><small>NET SAVING</small><strong>{fmtINR(lead?.netMonthly)}</strong><em>after EMI</em></div></div></>}{tab==='Partner routing'&&<><div><b>PARTNER ROUTING & LEAKAGE CONTROL</b><span>Route by pincode + capacity band and surface untouched leads.</span></div><div className="route"><div><b>RECOMMENDED EPC</b><strong>Himalayan Solar EPC · Leh</strong><span>194101 · 20–250 kW · SLA 2h</span></div><div><b>LEAD STATE</b><strong>{lead?.credit>=65?'Dispatch ready':'Credit review'}</strong><span>{lead?.band[0]}</span></div><div><b>LEAKAGE WATCH</b><strong>7 leads &gt; SLA</strong><span>3 high propensity · 2 credit ready</span></div></div></>}{tab==='Learning'&&<><div><b>CLOSED-LOOP LEARNING</b><span>Outcome labels update propensity and credit components; funded customers remain the KPI.</span></div><div className="learningFlow"><span>843 discovered</span><b>→</b><span>391 qualified</span><b>→</b><span>248 credit pass</span><b>→</b><span>127 dispatched</span><b>→</b><span>61 funded</span></div><div className="learningNote">Rejected for affordability lowers credit for similar bill/load patterns; quote drops lower conversion propensity for similar roof/tariff patterns.</div></>}</section>
+ </main></div>{wa&&<div className="overlay"><div className="wa"><div className="waHead"><div><b>SolarOS · WhatsApp qualification</b><small>{lead?.name}</small></div><button onClick={()=>setWa(false)}>×</button></div><div className="chat"><div className="msg out"><small>SolarOS</small>We found a rooftop opportunity near your parcel. Want a quick solar estimate?</div><div className="msg in"><small>Customer</small>How did you find my roof?</div><div className="msg out"><small>SolarOS</small>Map and rooftop geometry. We only continue if the property is usable for solar.</div><div className="msg out"><small>SolarOS</small>Is the roof owned or rented?</div><div className="msg in"><small>Customer</small>Owned.</div><div className="msg out"><small>SolarOS</small>What is the sanctioned load and your last 3 bill amounts?</div><div className="msg in"><small>Customer</small>125 kW. Bills were ₹1.2L, ₹1.1L and ₹1.3L.</div><div className="msg out"><small>SolarOS</small>Please share a roof photo. <em>✓✓</em></div><div className="msg out"><small>SolarOS</small>Affordability gate passed. Recommended {lead?.system} kW · {fmtINR(lead?.netMonthly)}/month net after EMI.</div></div><div className="waFoot"><button className="success" onClick={()=>setWa(false)}>QUALIFIED → EPC DISPATCH</button></div></div></div>}</div>
+}
+createRoot(document.getElementById('root')).render(<App/>);

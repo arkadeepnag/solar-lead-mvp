@@ -1,0 +1,18 @@
+{
+  "place": "Leh, Ladakh",
+  "bbox": [
+    77.535,
+    34.125,
+    77.625,
+    34.205
+  ],
+  "coverage": "Leh urban valley demo extent",
+  "building_count": 843,
+  "heat_points": 2592,
+  "note": "Pre-generated cadastral-style demo layer; replace with authoritative land records before production. Solar/climate fields are modeled from a static resource grid and are not a live API feed.",
+  "sources": [
+    "OpenStreetMap basemap",
+    "Ladakh Land Records GIS context",
+    "NASA POWER solar and meteorological methodology"
+  ]
+}
